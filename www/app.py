@@ -9,7 +9,7 @@ from datetime import datetime
 from aiohttp import web
 
 def index(request):
-    return web.Respnse(body=b'<h1>Awesome</h1>',content_type='text/plain')
+    return web.Response(body=b'<h1>Awesome</h1>',content_type='text/html')
 
 
 async def init(loop):
