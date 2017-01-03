@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 # encoding: utf-8
 
+__author__ = 'saka'
+
 import asyncio,logging
 
 import aiomysql
@@ -10,12 +12,11 @@ def log(sql,arg=()):
 
 #create a connection pool, every http request get a connection to db from
 #this pool, inner method is by aiomysql
-@asyncio.coroutine
-def create_pool(loop,**kw):
+async def create_pool(loop,**kw):
     logging.info('create database connection pool...')
     #kw is a dict, so method get can be called
     global __pool
-    __pool = yield from aiomysql.create_pool(
+    __pool = await aiomysql.create_pool(
         host = kw.get('host','localhost'),
         port = kw.get('port',3306),
         user = kw['user'],
@@ -28,47 +29,66 @@ def create_pool(loop,**kw):
         loop = loop
     )
 
-@asyncio.coroutine
-def select(sql,args,size=None):
+async def destroy_pool():
+    global __pool
+    if __pool is not None:
+        __pool.close()
+    await __pool.wait_closed()
+#===============SQL function=====================
+#the functions that run functions from aiomysql
+#parameter: sql is the sql query, args is the key to search
+#size is the number of rows to return
+async def select(sql,args,size=None):
     #sql is the sql query with ? as placeholder
     #args is tuple or list
     log(sql,args)
     global __pool
-    with (yield from __pool) as conn:
-        cur = yield from conn.cursor(aiomysql.DictCursor)
+    async with __pool.get() as conn:
+        async with conn.cursor(aiomysql.DictCursor) as cur:
         #the ruturn class of this cur is dictionary
-        yield from cur.execute(sql.replace('?','%s'),args or ())
+            await cur.execute(sql.replace('?','%s'),args or ())
        #replace SQL placeholder to MySQL placehoder
-        if size:
-            rs = yield from cur.fetchmany(size)
-        else:
-            rs = yield from cur.fetchall()
-        yield from cur.close()
+            if size:
+                rs = await cur.fetchmany(size)
+            else:
+                rs = await cur.fetchall()
         logging.info('rows returned:%s'%len(rs))
         return rs
 
 #insert,update,delete method for our database
-@asyncio.coroutine
-def execute(sql,args):
+#the reason why we use a different function is that
+#they don't return value as select
+async def execute(sql,args,autocommit=True):
     log(sql)
-    with (yield from __pool) as conn:
+    async with  __pool.get() as conn:
+        if not autocommit:
+            await conn.begin()
         try:
-            cur = yield from conn.cursor()
-            yield from cur.execute(sql.replace('?','%s'),args)
-            affectedline = cur.rowcount
-            yield from cur.close()
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(sql.replace('?','%s'),args)
+                affectedline = cur.rowcount
+            if not autocommit:
+                await conn.commit()
         except BaseException as e:
+            if not autocommit:
+                await conn.rollback()
             raise
         return affectedline
 
+#this function called in metaclass, create a string with
+#placeholders, number = num
 def create_args_string(num):
     L = []
     for n in range(num):
         L.append('?')
 
-    return (','.join(L))
+    return ','.join(L)
 
-
+#==============Field definition================
+#we will have model like user,comment to represent data and exchange
+#with database rows; when we use model, we need to know the type of its
+#attribute,set default and primarykey, which assist the procedure of exchanging data with database
+#
 class Field(object):
 
     def __init__(self,name,column_type,primary_key,default):
@@ -86,7 +106,7 @@ class StringField(Field):
         super().__init__(name,ddl,primary_key,default)
 
 class BooleanField(Field):
-    def __init__(self,name=None,default=None):
+    def __init__(self,name=None,default=False):
         super().__init__(name,'boolean',False,default)
 
 class IntergerField(Field):
@@ -99,8 +119,9 @@ class FloatField(Field):
 
 class TextField(Field):
     def __init__(self,name=None,default=None):
-        super().__init__(name,'Text',False,default)
+        super().__init__(name,'text',False,default)
 
+#==============class model================
 class ModelMetaclass(type):  #use metaclass
     def __new__(cls,name,bases,attrs):
         if name=='Model':
@@ -126,6 +147,7 @@ class ModelMetaclass(type):  #use metaclass
             raise RuntimeError('Primary key not found.')
         for k in mappings.keys():
             attrs.pop(k)
+            #save nonprimarykey field into escaped_field in another format, easy to call with sql
         escaped_fields = list(map(lambda f:'`%s`'%f,fields))
         attrs['__mappings__'] = mappings
         attrs['__table__'] = tableName
@@ -149,7 +171,7 @@ class Model(dict, metaclass=ModelMetaclass):
         try:
             return self[key]
         except KeyError:
-            raise AttributeError(r'"Model" object has no attribute:%s %key')
+            raise AttributeError(r"'Model' object has no attribute:'%s'" %key)
 
     def __setattr__(self,key,value):
         self[key] = value
@@ -169,8 +191,7 @@ class Model(dict, metaclass=ModelMetaclass):
 
 
     @classmethod
-    @asyncio.coroutine
-    def findAll(cls,where=None,args=None,**kw):
+    async def findAll(cls,where=None,args=None,**kw):
         '''find objects by where clause'''
         sql=[cls.__select__]
 
@@ -197,51 +218,46 @@ class Model(dict, metaclass=ModelMetaclass):
                 args.extend(limit)
             else:
                 raise ValueError('Invalid limit value: %s'%str(limit))
-        rs = yield from select(' '.join(sql),args)
+        rs =  await select(' '.join(sql),args)
         return [cls(**r) for r in rs]
 
     @classmethod
-    @asyncio.coroutine
-    def findNumber(cls,selectField,where=None,args=None):
-        sql = ['select %s __num__ from `%s`' %(selectField,cls.__table__)]
+    async def findNumber(cls,selectField,where=None,args=None):
+        sql = ['select %s _num_ from `%s`' %(selectField,cls.__table__)]
         if where:
             sql.append('where')
             sql.append(where)
-        rs = yield from select(' '.join(sql),args,1)
+        rs = await select(' '.join(sql),args,1)
         if len(rs) ==0:
             return None
-        return rs[0]['__num__']
+        return rs[0]['_num_']
 
     @classmethod
-    @asyncio.coroutine
-    def find(cls,pk):
+    async def find(cls,pk):
         ' find object by primary key. '
-        rs = yield from select('%s where `%s`=?'%(cls.__select__,cls.__primary_key__),[pk],1)
+        rs = await select('%s where `%s`=?'%(cls.__select__,cls.__primary_key__),[pk],1)
         if len(rs) == 0:
             return None
         return cls(**rs[0])
 
-    @asyncio.coroutine
-    def save(self):
+    async def save(self):
         args = list(map(self.getValueOrDefault,self.__fields__))
         args.append(self.getValueOrDefault(self.__primary_key__))
-        rows = yield from execute(self.__insert__,args)
+        rows = await execute(self.__insert__,args)
         if rows !=1:
             logging.warn('failed to insert record: affected rows: %s'%rows)
 
 
-    @asyncio.coroutine
-    def update(self):
+    async def update(self):
         args = list(map(self.getValue,self.__fields__))
         args.append(self.getValue(self.__primary_key__))
-        rows = yield from execute(self.__update__,args)
+        rows =  await execute(self.__update__,args)
         if rows !=1:
             logging.warn('failed to reomove by primary key: affected rows: %s'%rows)
 
-    @asyncio.coroutine
-    def remove(self):
+    async def remove(self):
         args = [self.getValue(self.__primary_key__)]
-        rows = yield from execute(self.__delete__,args)
+        rows =  await execute(self.__delete__,args)
         if rows !=1:
             logging.warn('failed to remove by primary key:affected rows: %s'%rows)
 
